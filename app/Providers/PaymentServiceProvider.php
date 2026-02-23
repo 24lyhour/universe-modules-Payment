@@ -2,6 +2,7 @@
 
 namespace Modules\Payment\Providers;
 
+use App\Services\MenuService;
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\ServiceProvider;
 use Nwidart\Modules\Traits\PathNamespace;
@@ -27,6 +28,26 @@ class PaymentServiceProvider extends ServiceProvider
         $this->registerConfig();
         $this->registerViews();
         $this->loadMigrationsFrom(module_path($this->name, 'database/migrations'));
+        $this->registerMenuItems();
+    }
+
+    /**
+     * Register menu items for the Payment module.
+     */
+    protected function registerMenuItems(): void
+    {
+        $this->app->booted(function () {
+            MenuService::addMenuItem(
+                menu: 'primary',
+                id: 'payment',
+                title: __('Payment'),
+                url: route('payment.index'),
+                icon: 'CreditCard',
+                order: 70,
+                permissions: 'payments.view_any',
+                route: 'payment.*'
+            );
+        });
     }
 
     /**
