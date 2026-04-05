@@ -41,11 +41,35 @@ class PaymentServiceProvider extends ServiceProvider
                 menu: 'primary',
                 id: 'payment',
                 title: __('Payment'),
-                url: route('payment.index'),
+                url: route('payment.transactions.index'),
                 icon: 'CreditCard',
                 order: 70,
                 permissions: 'payments.view_any',
                 route: 'payment.*'
+            );
+
+            // Transactions submenu
+            MenuService::addSubmenuItem(
+                'primary',
+                'payment',
+                __('Transactions'),
+                route('payment.transactions.index'),
+                1,
+                'payments.view_any',
+                'payment.transactions.*',
+                'ArrowLeftRight'
+            );
+
+            // Settings submenu
+            MenuService::addSubmenuItem(
+                'primary',
+                'payment',
+                __('Settings'),
+                route('payment.settings.index'),
+                2,
+                'payments.view_any',
+                'payment.settings.*',
+                'Settings'
             );
         });
     }

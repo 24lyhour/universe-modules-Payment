@@ -123,12 +123,6 @@ class PayWayController extends Controller
             'signature' => substr($signature, 0, 20) . '...',
         ]);
 
-        // Verify signature
-        if ($signature && !$this->payWayService->verifyCallback($payload, $signature)) {
-            Log::warning('PayWay: Invalid callback signature');
-            return response()->json(['error' => 'Invalid signature'], 401);
-        }
-
         $tranId = $payload['tran_id'] ?? null;
         $status = $payload['status'] ?? null;
 
@@ -145,6 +139,18 @@ class PayWayController extends Controller
         }
 
         $order = $transaction->order;
+
+        // Use outlet's credentials for signature verification if available
+        $service = $this->payWayService;
+        if ($order && $order->outlet && $order->outlet->hasPayWay()) {
+            $service = app(PayWayService::class)->forOutlet($order->outlet);
+        }
+
+        // Verify signature
+        if ($signature && !$service->verifyCallback($payload, $signature)) {
+            Log::warning('PayWay: Invalid callback signature');
+            return response()->json(['error' => 'Invalid signature'], 401);
+        }
 
         // Status 0 or "0" = success
         if ($status === 0 || $status === '0') {
@@ -190,8 +196,15 @@ class PayWayController extends Controller
             return response()->json(['message' => 'Transaction not found.'], 404);
         }
 
+        // Use outlet's credentials if available
+        $service = $this->payWayService;
+        $order = $transaction->order;
+        if ($order && $order->outlet && $order->outlet->hasPayWay()) {
+            $service = app(PayWayService::class)->forOutlet($order->outlet);
+        }
+
         // Also check with PayWay API for latest status
-        $paywayResult = $this->payWayService->checkTransaction($tranId);
+        $paywayResult = $service->checkTransaction($tranId);
 
         $paymentStatus = 'pending';
         if ($paywayResult['success'] && isset($paywayResult['data']['payment_status_code'])) {

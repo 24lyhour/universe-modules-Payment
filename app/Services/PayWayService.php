@@ -4,6 +4,7 @@ namespace Modules\Payment\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Modules\Outlet\Models\Outlet;
 
 class PayWayService
 {
@@ -18,6 +19,18 @@ class PayWayService
         $this->apiKey = config('payment.payway.api_key');
         $this->baseUrl = config('payment.payway.base_url');
         $this->callbackUrl = config('payment.payway.callback_url');
+    }
+
+    /**
+     * Use outlet-specific merchant credentials.
+     */
+    public function forOutlet(Outlet $outlet): self
+    {
+        if ($outlet->hasPayWay()) {
+            $this->merchantId = $outlet->payway_merchant_id;
+            $this->apiKey = $outlet->payway_api_key;
+        }
+        return $this;
     }
 
     /**
