@@ -63,7 +63,11 @@ class PayWayService
             ? base64_encode($params['continue_success_url'])
             : '';
         $cancelUrl = $params['cancel_url'] ?? '';
-        $returnDeeplink = '';
+        //. deeplin for the base phone 
+        $returnDeeplink = base64_encode(json_encode([
+            'ios_scheme' => config('payment.payway.return_deeplink_ios', 'cylicon://payment-result'),
+            'android_scheme' => config('payment.payway.return_deeplink_android', 'cylicon://payment-result'),
+        ]));
         $customFields = '';
         $returnParams = $params['return_params'] ?? '';
         $shipping = $params['shipping'] ?? '';
@@ -114,6 +118,7 @@ class PayWayService
             'type' => $type,
             'payment_option' => $paymentOption,
             'return_url' => $returnUrl,
+            'return_deeplink' => $returnDeeplink,
             'currency' => $currency,
         ];
 
@@ -176,10 +181,10 @@ class PayWayService
         $callbackUrl = base64_encode($this->callbackUrl);
         $returnDeeplink = '';
         $customFields = '';
-        $returnParams = $params['return_params'] ?? '';
+        $returnParams = '';
         $payout = '';
-        $lifetime = $params['lifetime'] ?? '';
-        $qrImageTemplate = $params['qr_image_template'] ?? 'template6_color';
+        $lifetime = $params['lifetime'] ?? 6;
+        $qrImageTemplate = $params['qr_image_template'] ?? 'template4_color';
 
         // Items as base64 JSON
         $items = '';
@@ -214,22 +219,25 @@ class PayWayService
             'req_time' => $reqTime,
             'merchant_id' => $this->merchantId,
             'tran_id' => $tranId,
-            'amount' => $amount,
-            'currency' => $currency,
-            'payment_option' => $paymentOption,
             'first_name' => $firstName,
             'last_name' => $lastName,
             'email' => $email,
             'phone' => $phone,
+            'amount' => $amount,
             'purchase_type' => $purchaseType,
+            'payment_option' => $paymentOption,
+            'currency' => $currency,
             'callback_url' => $callbackUrl,
-            'return_params' => $returnParams,
+            'return_deeplink' => null,
+            'custom_fields' => null,
+            'return_params' => null,
+            'payout' => null,
+            'lifetime' => $lifetime,
             'qr_image_template' => $qrImageTemplate,
             'hash' => $hash,
         ];
 
         if ($items) $payload['items'] = $items;
-        if ($lifetime) $payload['lifetime'] = $lifetime;
 
         Log::info('PayWay: Generating QR', ['tran_id' => $tranId, 'amount' => $amount, 'template' => $qrImageTemplate]);
 
@@ -276,12 +284,13 @@ class PayWayService
         $hash = $this->generateHash($hashData);
 
         try {
-            $response = Http::post("{$this->baseUrl}/api/payment-gateway/v1/payments/check-transaction-2", [
-                'req_time' => $reqTime,
-                'merchant_id' => $this->merchantId,
-                'tran_id' => $tranId,
-                'hash' => $hash,
-            ]);
+            $response = Http::asMultipart()
+                ->post("{$this->baseUrl}/api/payment-gateway/v1/payments/check-transaction-2", $this->toMultipart([
+                    'req_time' => $reqTime,
+                    'merchant_id' => $this->merchantId,
+                    'tran_id' => $tranId,
+                    'hash' => $hash,
+                ]));
 
             $body = $response->json();
 
