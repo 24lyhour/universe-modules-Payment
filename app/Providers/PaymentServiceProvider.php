@@ -2,9 +2,10 @@
 
 namespace Modules\Payment\Providers;
 
-use App\Services\MenuService;
+use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\ServiceProvider;
+use Modules\Payment\Http\Middleware\DashboardMiddlewareHandle;
 use Nwidart\Modules\Traits\PathNamespace;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
@@ -28,50 +29,17 @@ class PaymentServiceProvider extends ServiceProvider
         $this->registerConfig();
         $this->registerViews();
         $this->loadMigrationsFrom(module_path($this->name, 'database/migrations'));
-        $this->registerMenuItems();
+        $this->registerDashboardMiddleware();
     }
 
     /**
-     * Register menu items for the Payment module.
+     * Sidebar entries live in DashboardMiddlewareHandle.
      */
-    protected function registerMenuItems(): void
+    protected function registerDashboardMiddleware(): void
     {
-        $this->app->booted(function () {
-            MenuService::addMenuItem(
-                menu: 'primary',
-                id: 'payment',
-                title: __('Payment'),
-                url: route('payment.transactions.index'),
-                icon: 'CreditCard',
-                order: 70,
-                permissions: 'payments.view_any',
-                route: 'payment.*'
-            );
-
-            // Transactions submenu
-            MenuService::addSubmenuItem(
-                'primary',
-                'payment',
-                __('Transactions'),
-                route('payment.transactions.index'),
-                1,
-                'payments.view_any',
-                'payment.transactions.*',
-                'ArrowLeftRight'
-            );
-
-            // Settings submenu
-            MenuService::addSubmenuItem(
-                'primary',
-                'payment',
-                __('Settings'),
-                route('payment.settings.index'),
-                2,
-                'payments.view_any',
-                'payment.settings.*',
-                'Settings'
-            );
-        });
+        /** @var \Illuminate\Foundation\Http\Kernel $kernel */
+        $kernel = $this->app->make(HttpKernel::class);
+        $kernel->prependMiddlewareToGroup('web', DashboardMiddlewareHandle::class);
     }
 
     /**
