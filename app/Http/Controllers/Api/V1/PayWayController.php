@@ -6,10 +6,15 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Modules\Booking\Enums\BookingStatus;
+use Modules\Booking\Enums\PaymentStatus as BookingPaymentStatus;
+use Modules\Booking\Models\BookingTransaction;
 use Modules\Order\Enums\PaymentStatusEnum;
 use Modules\Order\Models\Order;
 use Modules\Order\Models\Transaction;
+use Modules\Payment\Events\PaymentCompleted;
 use Modules\Payment\Services\PayWayService;
+use Modules\Wallets\Models\TopUp;
 
 class PayWayController extends Controller
 {
@@ -130,15 +135,30 @@ class PayWayController extends Controller
             return response()->json(['error' => 'Missing tran_id'], 400);
         }
 
-        // Find the transaction
+        // Try to find Order transaction first
         $transaction = Transaction::where('gateway_transaction_id', $tranId)->first();
+        $bookingTransaction = null;
+        $topup = null;
+        $order = null;
+        $booking = null;
 
-        if (!$transaction) {
+        if ($transaction) {
+            $order = $transaction->order;
+        } else {
+            // Try to find Booking transaction
+            $bookingTransaction = BookingTransaction::where('gateway_transaction_id', $tranId)->first();
+            if ($bookingTransaction) {
+                $booking = $bookingTransaction->booking;
+            } else {
+                // Try to find TopUp
+                $topup = TopUp::where('gateway_reference', $tranId)->first();
+            }
+        }
+
+        if (!$transaction && !$bookingTransaction && !$topup) {
             Log::warning('PayWay: Transaction not found', ['tran_id' => $tranId]);
             return response()->json(['error' => 'Transaction not found'], 404);
         }
-
-        $order = $transaction->order;
 
         // Use outlet's credentials for signature verification if available
         $service = $this->payWayService;
@@ -154,25 +174,98 @@ class PayWayController extends Controller
 
         // Status 0 or "0" = success
         if ($status === 0 || $status === '0') {
-            $transaction->markAsCompleted($tranId);
-            $transaction->update(['gateway_response' => $payload]);
+            // Handle Order payment
+            if ($transaction && $order) {
+                $transaction->markAsCompleted($tranId);
+                $transaction->update(['gateway_response' => $payload]);
 
-            if ($order) {
                 $order->update([
                     'payment_status' => PaymentStatusEnum::Paid,
                     'status' => 'confirmed',
                 ]);
+
+                Log::info('PayWay: Order payment successful', ['tran_id' => $tranId, 'order' => $order->order_number]);
+
+                // Broadcast payment success to Flutter app
+                if ($transaction->customer_id) {
+                    event(new PaymentCompleted(
+                        customerId: $transaction->customer_id,
+                        tranId: $tranId,
+                        orderUuid: $order->uuid,
+                        orderNumber: $order->order_number,
+                        amount: (float) $transaction->amount,
+                        status: 'paid',
+                    ));
+                }
             }
 
-            Log::info('PayWay: Payment successful', ['tran_id' => $tranId, 'order' => $order?->order_number]);
-        } else {
-            $transaction->markAsFailed(
-                "PayWay status: {$status}",
-                $payload
-            );
+            // Handle Booking payment
+            if ($bookingTransaction && $booking) {
+                $bookingTransaction->markAsCompleted($tranId);
+                $bookingTransaction->update(['gateway_response' => $payload]);
 
-            if ($order) {
-                $order->update(['payment_status' => PaymentStatusEnum::Failed]);
+                $booking->update([
+                    'payment_status' => BookingPaymentStatus::Paid,
+                    'status' => BookingStatus::Confirmed,
+                    'confirmed_at' => now(),
+                    'payment_reference' => $tranId,
+                ]);
+
+                Log::info('PayWay: Booking payment successful', ['tran_id' => $tranId, 'booking' => $booking->code]);
+            }
+
+            // Handle TopUp payment
+            if ($topup) {
+                $topup->update(['metadata' => array_merge($topup->metadata ?? [], [
+                    'payway_callback' => $payload,
+                ])]);
+
+                $walletTransaction = $topup->complete();
+
+                if ($walletTransaction) {
+                    Log::info('PayWay: TopUp payment successful', [
+                        'tran_id' => $tranId,
+                        'topup_reference' => $topup->reference,
+                        'amount' => $topup->amount,
+                        'wallet_id' => $topup->wallet_id,
+                    ]);
+                } else {
+                    Log::warning('PayWay: TopUp could not be completed', [
+                        'tran_id' => $tranId,
+                        'topup_reference' => $topup->reference,
+                        'status' => $topup->status,
+                    ]);
+                }
+            }
+        } else {
+            // Handle Order payment failure
+            if ($transaction) {
+                $transaction->markAsFailed("PayWay status: {$status}", $payload);
+                if ($order) {
+                    $order->update(['payment_status' => PaymentStatusEnum::Failed]);
+                }
+            }
+
+            // Handle Booking payment failure
+            if ($bookingTransaction) {
+                $bookingTransaction->markAsFailed("PayWay status: {$status}", $payload);
+                if ($booking) {
+                    $booking->update(['payment_status' => BookingPaymentStatus::Failed]);
+                }
+            }
+
+            // Handle TopUp payment failure
+            if ($topup) {
+                $topup->update(['metadata' => array_merge($topup->metadata ?? [], [
+                    'payway_callback' => $payload,
+                ])]);
+                $topup->markAsFailed("PayWay status: {$status}");
+
+                Log::info('PayWay: TopUp payment failed', [
+                    'tran_id' => $tranId,
+                    'topup_reference' => $topup->reference,
+                    'status' => $status,
+                ]);
             }
 
             Log::info('PayWay: Payment failed', ['tran_id' => $tranId, 'status' => $status]);
@@ -207,8 +300,10 @@ class PayWayController extends Controller
         $paywayResult = $service->checkTransaction($tranId);
 
         $paymentStatus = 'pending';
-        if ($paywayResult['success'] && isset($paywayResult['data']['payment_status_code'])) {
-            $statusCode = $paywayResult['data']['payment_status_code'];
+        // PayWay response structure: { data: { data: { payment_status_code: 0 }, status: {...} } }
+        $paywayData = $paywayResult['data']['data'] ?? $paywayResult['data'] ?? [];
+        if ($paywayResult['success'] && isset($paywayData['payment_status_code'])) {
+            $statusCode = $paywayData['payment_status_code'];
 
             if ($statusCode === 0) {
                 $paymentStatus = 'paid';
@@ -216,7 +311,7 @@ class PayWayController extends Controller
                 // Update local records if not already updated
                 if ($transaction->isPending() || $transaction->status->value === 'processing') {
                     $transaction->markAsCompleted($tranId);
-                    $transaction->update(['gateway_response' => $paywayResult['data']]);
+                    $transaction->update(['gateway_response' => $paywayData]);
 
                     $order = $transaction->order;
                     if ($order && $order->payment_status !== PaymentStatusEnum::Paid) {
@@ -241,6 +336,73 @@ class PayWayController extends Controller
                 'payment_status' => $paymentStatus,
                 'order_uuid' => $transaction->order?->uuid,
                 'order_status' => $transaction->order?->status->value ?? $transaction->order?->status,
+            ],
+        ]);
+    }
+
+    /**
+     * Check top-up payment status (called by Flutter to poll).
+     */
+    public function checkTopUpStatus(Request $request, string $tranId): JsonResponse
+    {
+        $customer = $request->user();
+
+        $topup = TopUp::where('gateway_reference', $tranId)
+            ->where('customer_id', $customer->id)
+            ->first();
+
+        if (!$topup) {
+            return response()->json(['message' => 'Top-up not found.'], 404);
+        }
+
+        // Check with PayWay API for latest status
+        $paywayResult = $this->payWayService->checkTransaction($tranId);
+
+        $paymentStatus = 'pending';
+        $paywayData = $paywayResult['data']['data'] ?? $paywayResult['data'] ?? [];
+
+        if ($paywayResult['success'] && isset($paywayData['payment_status_code'])) {
+            $statusCode = $paywayData['payment_status_code'];
+
+            if ($statusCode === 0) {
+                $paymentStatus = 'paid';
+
+                // Update local records if not already completed
+                if ($topup->status->value === 'pending' || $topup->status->value === 'processing') {
+                    $topup->update(['metadata' => array_merge($topup->metadata ?? [], [
+                        'payway_check' => $paywayData,
+                    ])]);
+
+                    $walletTransaction = $topup->complete();
+
+                    if ($walletTransaction) {
+                        Log::info('PayWay: TopUp completed via status check', [
+                            'tran_id' => $tranId,
+                            'topup_reference' => $topup->reference,
+                            'amount' => $topup->amount,
+                        ]);
+                    }
+                }
+            } elseif ($statusCode === 3) {
+                $paymentStatus = 'declined';
+            } elseif ($statusCode === 7) {
+                $paymentStatus = 'cancelled';
+            } elseif ($statusCode === 2) {
+                $paymentStatus = 'pending';
+            }
+        }
+
+        // Refresh topup to get latest status
+        $topup->refresh();
+
+        return response()->json([
+            'data' => [
+                'tran_id' => $tranId,
+                'payment_status' => $paymentStatus,
+                'topup_reference' => $topup->reference,
+                'topup_status' => $topup->status->value,
+                'amount' => (float) $topup->amount,
+                'wallet_balance' => $topup->wallet ? (float) $topup->wallet->balance : null,
             ],
         ]);
     }

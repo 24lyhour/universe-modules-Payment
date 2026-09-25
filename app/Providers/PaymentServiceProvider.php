@@ -56,7 +56,9 @@ class PaymentServiceProvider extends ServiceProvider
      */
     protected function registerCommands(): void
     {
-        // $this->commands([]);
+        $this->commands([
+            \Modules\Payment\Console\TestPayWayCommand::class,
+        ]);
     }
 
     /**

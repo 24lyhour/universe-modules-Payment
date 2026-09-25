@@ -5,306 +5,120 @@ namespace Modules\Payment\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Modules\Outlet\Models\Outlet;
+use Modules\Payment\Services\PayWay\PayWayConfig;
+use Modules\Payment\Services\PayWay\PayWayHashGenerator;
+use Modules\Payment\Services\PayWay\PayWayResponseHandler;
+use Modules\Payment\Services\PayWay\DTOs\PurchaseRequest;
+use Modules\Payment\Services\PayWay\DTOs\QrRequest;
+use Modules\Payment\Services\PayWay\DTOs\PayWayResponse;
 
 class PayWayService
 {
-    protected string $merchantId;
-    protected string $apiKey;
-    protected string $baseUrl;
-    protected string $callbackUrl;
+    private PayWayConfig $config;
+    private PayWayHashGenerator $hashGenerator;
+    private PayWayResponseHandler $responseHandler;
 
-    public function __construct()
-    {
-        $this->merchantId = config('payment.payway.merchant_id');
-        $this->apiKey = config('payment.payway.api_key');
-        $this->baseUrl = config('payment.payway.base_url');
-        $this->callbackUrl = config('payment.payway.callback_url');
+    public function __construct(
+        ?PayWayConfig $config = null,
+        ?PayWayHashGenerator $hashGenerator = null,
+        ?PayWayResponseHandler $responseHandler = null
+    ) {
+        $this->config = $config ?? PayWayConfig::fromConfig();
+        $this->hashGenerator = $hashGenerator ?? new PayWayHashGenerator($this->config);
+        $this->responseHandler = $responseHandler ?? new PayWayResponseHandler();
     }
 
     /**
-     * Use outlet-specific merchant credentials.
+     * Create a new instance with outlet-specific merchant credentials.
+     * Returns a new instance to avoid mutating the singleton.
      */
     public function forOutlet(Outlet $outlet): self
     {
-        if ($outlet->hasPayWay()) {
-            $this->merchantId = $outlet->payway_merchant_id;
-            $this->apiKey = $outlet->payway_api_key;
+        if (!$outlet->hasPayWay()) {
+            return $this;
         }
-        return $this;
-    }
 
-    /**
-     * Generate HMAC-SHA512 hash for PayWay API.
-     */
-    public function generateHash(string $data): string
-    {
-        return base64_encode(hash_hmac('sha512', $data, $this->apiKey, true));
+        $newConfig = $this->config->withOutletCredentials(
+            $outlet->payway_merchant_id,
+            $outlet->payway_api_key
+        );
+
+        return new self(
+            config: $newConfig,
+            hashGenerator: new PayWayHashGenerator($newConfig),
+            responseHandler: $this->responseHandler
+        );
     }
 
     /**
      * Create a purchase transaction with PayWay.
-     *
-     * Returns deeplink + QR for ABA PAY, or checkout URL for cards.
      */
-    public function createPurchase(array $params): array
+    public function createPurchase(array $params): PayWayResponse
     {
-        $reqTime = gmdate('YmdHis');
-        $tranId = $params['tran_id'];
-        $amount = $params['amount'];
-        $firstName = $params['firstname'] ?? '';
-        $lastName = $params['lastname'] ?? '';
-        $email = $params['email'] ?? '';
-        $phone = $params['phone'] ?? '';
-        $type = $params['type'] ?? 'purchase';
-        $paymentOption = $params['payment_option'] ?? 'abapay_khqr_deeplink';
-        $currency = $params['currency'] ?? 'USD';
-        $returnUrl = base64_encode($this->callbackUrl);
-        $continueSuccessUrl = isset($params['continue_success_url'])
-            ? base64_encode($params['continue_success_url'])
-            : '';
-        $cancelUrl = $params['cancel_url'] ?? '';
-        //. deeplin for the base phone 
-        $returnDeeplink = base64_encode(json_encode([
-            'ios_scheme' => config('payment.payway.return_deeplink_ios', 'cylicon://payment-result'),
-            'android_scheme' => config('payment.payway.return_deeplink_android', 'cylicon://payment-result'),
-        ]));
-        $customFields = '';
-        $returnParams = $params['return_params'] ?? '';
-        $shipping = $params['shipping'] ?? '';
-        $payout = '';
-        $lifetime = $params['lifetime'] ?? '';
+        $request = PurchaseRequest::fromArray($params, $this->config);
 
-        // Items as base64 JSON
-        $items = '';
-        if (!empty($params['items'])) {
-            $items = base64_encode(json_encode($params['items']));
-        }
+        $hash = $this->hashGenerator->generatePurchaseHash($request);
+        $payload = $request->toPayload($this->config->getMerchantId(), $hash);
 
-        // Hash concatenation order (from PayWay docs)
-        $hashData = $reqTime
-            . $this->merchantId
-            . $tranId
-            . $amount
-            . $items
-            . $shipping
-            . $firstName
-            . $lastName
-            . $email
-            . $phone
-            . $type
-            . $paymentOption
-            . $returnUrl
-            . $cancelUrl
-            . $continueSuccessUrl
-            . $returnDeeplink
-            . $currency
-            . $customFields
-            . $returnParams
-            . $payout
-            . $lifetime;
+        Log::info('PayWay: Creating purchase', [
+            'tran_id' => $request->tranId,
+            'amount' => $request->amount,
+        ]);
 
-        $hash = $this->generateHash($hashData);
-
-        $payload = [
-            'req_time' => $reqTime,
-            'merchant_id' => $this->merchantId,
-            'tran_id' => $tranId,
-            'amount' => $amount,
-            'hash' => $hash,
-            'firstname' => $firstName,
-            'lastname' => $lastName,
-            'email' => $email,
-            'phone' => $phone,
-            'type' => $type,
-            'payment_option' => $paymentOption,
-            'return_url' => $returnUrl,
-            'return_deeplink' => $returnDeeplink,
-            'currency' => $currency,
-        ];
-
-        if ($items) $payload['items'] = $items;
-        if ($shipping) $payload['shipping'] = $shipping;
-        if ($cancelUrl) $payload['cancel_url'] = $cancelUrl;
-        if ($continueSuccessUrl) $payload['continue_success_url'] = $continueSuccessUrl;
-        if ($returnParams) $payload['return_params'] = $returnParams;
-        if ($lifetime) $payload['lifetime'] = $lifetime;
-
-        Log::info('PayWay: Creating purchase', ['tran_id' => $tranId, 'amount' => $amount]);
-
-        try {
-            $response = Http::asMultipart()
-                ->post("{$this->baseUrl}/api/payment-gateway/v1/payments/purchase", $this->toMultipart($payload));
-
-            $body = $response->json() ?? $response->body();
-
-            Log::info('PayWay: Purchase response', [
-                'status' => $response->status(),
-                'body' => is_string($body) ? substr($body, 0, 500) : $body,
-            ]);
-
-            if ($response->successful() && is_array($body)) {
-                return [
-                    'success' => ($body['status']['code'] ?? '') === '00',
-                    'data' => $body,
-                ];
-            }
-
-            return [
-                'success' => false,
-                'error' => is_array($body) ? ($body['status']['message'] ?? 'Unknown error') : 'Invalid response',
-                'data' => $body,
-            ];
-        } catch (\Exception $e) {
-            Log::error('PayWay: Purchase failed', ['error' => $e->getMessage()]);
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
+        return $this->executeRequest(
+            endpoint: '/api/payment-gateway/v1/payments/purchase',
+            payload: $payload,
+            useMultipart: true,
+            context: 'Purchase'
+        );
     }
 
     /**
      * Generate branded KHQR QR code via PayWay Generate QR API.
      */
-    public function generateQr(array $params): array
+    public function generateQr(array $params): PayWayResponse
     {
-        $reqTime = gmdate('YmdHis');
-        $tranId = $params['tran_id'];
-        $amount = $params['amount'];
-        $firstName = $params['firstname'] ?? '';
-        $lastName = $params['lastname'] ?? '';
-        $email = $params['email'] ?? '';
-        $phone = $params['phone'] ?? '';
-        $purchaseType = $params['purchase_type'] ?? 'purchase';
-        $paymentOption = $params['payment_option'] ?? 'abapay_khqr';
-        $currency = $params['currency'] ?? 'USD';
-        $callbackUrl = base64_encode($this->callbackUrl);
-        $returnDeeplink = '';
-        $customFields = '';
-        $returnParams = '';
-        $payout = '';
-        $lifetime = $params['lifetime'] ?? 6;
-        $qrImageTemplate = $params['qr_image_template'] ?? 'template4_color';
+        $request = QrRequest::fromArray($params, $this->config);
 
-        // Items as base64 JSON
-        $items = '';
-        if (!empty($params['items'])) {
-            $items = base64_encode(json_encode($params['items']));
-        }
+        $hash = $this->hashGenerator->generateQrHash($request);
+        $payload = $request->toPayload($this->config->getMerchantId(), $hash);
 
-        // Hash concatenation order (from PayWay QR API docs)
-        $hashData = $reqTime
-            . $this->merchantId
-            . $tranId
-            . $amount
-            . $items
-            . $firstName
-            . $lastName
-            . $email
-            . $phone
-            . $purchaseType
-            . $paymentOption
-            . $callbackUrl
-            . $returnDeeplink
-            . $currency
-            . $customFields
-            . $returnParams
-            . $payout
-            . $lifetime
-            . $qrImageTemplate;
+        Log::info('PayWay: Generating QR', [
+            'tran_id' => $request->tranId,
+            'amount' => $request->amount,
+            'template' => $request->qrImageTemplate,
+        ]);
 
-        $hash = $this->generateHash($hashData);
-
-        $payload = [
-            'req_time' => $reqTime,
-            'merchant_id' => $this->merchantId,
-            'tran_id' => $tranId,
-            'first_name' => $firstName,
-            'last_name' => $lastName,
-            'email' => $email,
-            'phone' => $phone,
-            'amount' => $amount,
-            'purchase_type' => $purchaseType,
-            'payment_option' => $paymentOption,
-            'currency' => $currency,
-            'callback_url' => $callbackUrl,
-            'return_deeplink' => null,
-            'custom_fields' => null,
-            'return_params' => null,
-            'payout' => null,
-            'lifetime' => $lifetime,
-            'qr_image_template' => $qrImageTemplate,
-            'hash' => $hash,
-        ];
-
-        if ($items) $payload['items'] = $items;
-
-        Log::info('PayWay: Generating QR', ['tran_id' => $tranId, 'amount' => $amount, 'template' => $qrImageTemplate]);
-
-        try {
-            $response = Http::post("{$this->baseUrl}/api/payment-gateway/v1/payments/generate-qr", $payload);
-
-            $body = $response->json() ?? $response->body();
-
-            Log::info('PayWay: QR response', [
-                'status' => $response->status(),
-                'body' => is_string($body) ? substr($body, 0, 500) : array_diff_key($body, ['qrImage' => true]),
-            ]);
-
-            if ($response->successful() && is_array($body)) {
-                $code = $body['status']['code'] ?? '';
-                return [
-                    'success' => $code === '0' || $code === 0,
-                    'data' => $body,
-                ];
-            }
-
-            return [
-                'success' => false,
-                'error' => is_array($body) ? ($body['status']['message'] ?? 'Unknown error') : 'Invalid response',
-                'data' => $body,
-            ];
-        } catch (\Exception $e) {
-            Log::error('PayWay: Generate QR failed', ['error' => $e->getMessage()]);
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
+        return $this->executeRequest(
+            endpoint: '/api/payment-gateway/v1/payments/generate-qr',
+            payload: $payload,
+            useMultipart: false,
+            context: 'Generate QR',
+            successCodes: ['0', 0]
+        );
     }
 
     /**
      * Check transaction status.
      */
-    public function checkTransaction(string $tranId): array
+    public function checkTransaction(string $tranId): PayWayResponse
     {
-        $reqTime = gmdate('YmdHis');
+        $reqTime = $this->generateRequestTime();
+        $hash = $this->hashGenerator->generate($reqTime . $this->config->getMerchantId() . $tranId);
 
-        $hashData = $reqTime . $this->merchantId . $tranId;
-        $hash = $this->generateHash($hashData);
+        $payload = [
+            'req_time' => $reqTime,
+            'merchant_id' => $this->config->getMerchantId(),
+            'tran_id' => $tranId,
+            'hash' => $hash,
+        ];
 
-        try {
-            $response = Http::asMultipart()
-                ->post("{$this->baseUrl}/api/payment-gateway/v1/payments/check-transaction-2", $this->toMultipart([
-                    'req_time' => $reqTime,
-                    'merchant_id' => $this->merchantId,
-                    'tran_id' => $tranId,
-                    'hash' => $hash,
-                ]));
-
-            $body = $response->json();
-
-            return [
-                'success' => $response->successful(),
-                'data' => $body,
-            ];
-        } catch (\Exception $e) {
-            Log::error('PayWay: Check transaction failed', ['error' => $e->getMessage()]);
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
+        return $this->executeRequest(
+            endpoint: '/api/payment-gateway/v1/payments/check-transaction-2',
+            payload: $payload,
+            useMultipart: true,
+            context: 'Check transaction'
+        );
     }
 
     /**
@@ -312,39 +126,144 @@ class PayWayService
      */
     public function verifyCallback(array $payload, string $signature): bool
     {
-        $sorted = $payload;
-        ksort($sorted);
-
-        $hashData = '';
-        foreach ($sorted as $value) {
-            if (is_array($value)) {
-                $value = json_encode($value);
-            }
-            $hashData .= $value;
-        }
-
-        $expectedSignature = $this->generateHash($hashData);
+        $hashData = $this->buildCallbackHashData($payload);
+        $expectedSignature = $this->hashGenerator->generate($hashData);
 
         return hash_equals($expectedSignature, $signature);
     }
 
     /**
      * Generate a unique transaction ID for PayWay (max 20 chars).
+     * Format: {PREFIX}{ORDER_ID}-{UNIQUE_6} = max 3 + 6 + 1 + 6 = 16 chars
      */
     public function generateTranId(int $orderId): string
     {
-        return 'CYL' . $orderId . '-' . substr(uniqid(), -6);
+        $prefix = config('payment.payway.tran_id_prefix', 'CYL');
+        $uniquePart = substr(uniqid(), -6);
+
+        // Ensure order ID doesn't make the total exceed 20 chars
+        // Max: 3 (prefix) + 1 (-) + 6 (unique) = 10, leaving 10 for orderId
+        $maxOrderIdLength = 20 - strlen($prefix) - 1 - 6;
+        $orderIdStr = (string) $orderId;
+
+        if (strlen($orderIdStr) > $maxOrderIdLength) {
+            $orderIdStr = substr($orderIdStr, -$maxOrderIdLength);
+        }
+
+        return "{$prefix}{$orderIdStr}-{$uniquePart}";
     }
 
     /**
-     * Convert associative array to multipart format for HTTP client.
+     * Generate hash for external use.
      */
-    protected function toMultipart(array $data): array
+    public function generateHash(string $data): string
     {
-        $multipart = [];
-        foreach ($data as $key => $value) {
-            $multipart[] = ['name' => $key, 'contents' => (string) $value];
+        return $this->hashGenerator->generate($data);
+    }
+
+    /**
+     * Get current merchant ID.
+     */
+    public function getMerchantId(): string
+    {
+        return $this->config->getMerchantId();
+    }
+
+    /**
+     * Get current API key.
+     */
+    public function getApiKey(): string
+    {
+        return $this->config->getApiKey();
+    }
+
+    /**
+     * Get current base URL.
+     */
+    public function getBaseUrl(): string
+    {
+        return $this->config->getBaseUrl();
+    }
+
+    /**
+     * Get current callback URL.
+     */
+    public function getCallbackUrl(): string
+    {
+        return $this->config->getCallbackUrl();
+    }
+
+    /**
+     * Get the config object.
+     */
+    public function getConfig(): PayWayConfig
+    {
+        return $this->config;
+    }
+
+    private const HTTP_TIMEOUT_SECONDS = 30;
+
+    /**
+     * Execute HTTP request to PayWay API.
+     */
+    private function executeRequest(
+        string $endpoint,
+        array $payload,
+        bool $useMultipart,
+        string $context,
+        array $successCodes = ['00']
+    ): PayWayResponse {
+        try {
+            $url = $this->config->getBaseUrl() . $endpoint;
+
+            $http = Http::timeout(self::HTTP_TIMEOUT_SECONDS)
+                ->connectTimeout(10);
+
+            $response = $useMultipart
+                ? $http->asMultipart()->post($url, $this->toMultipart($payload))
+                : $http->post($url, $payload);
+
+            return $this->responseHandler->handle($response, $context, $successCodes);
+        } catch (\Exception $e) {
+            Log::error("PayWay: {$context} failed", ['error' => $e->getMessage()]);
+
+            return PayWayResponse::error($e->getMessage());
         }
-        return $multipart;
+    }
+
+    /**
+     * Build hash data from callback payload.
+     */
+    private function buildCallbackHashData(array $payload): string
+    {
+        $sorted = $payload;
+        ksort($sorted);
+
+        $hashData = '';
+        foreach ($sorted as $value) {
+            $hashData .= is_array($value) ? json_encode($value) : $value;
+        }
+
+        return $hashData;
+    }
+
+    /**
+     * Generate request timestamp in PayWay format.
+     */
+    private function generateRequestTime(): string
+    {
+        return gmdate('YmdHis');
+    }
+
+    /**
+     * Convert associative array to multipart format.
+     */
+    private function toMultipart(array $data): array
+    {
+        return array_map(
+            fn($key, $value) => ['name' => $key, 'contents' => (string) $value],
+            array_keys($data),
+            array_values($data)
+        );
     }
 }
